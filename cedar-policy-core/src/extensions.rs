@@ -27,7 +27,7 @@ pub mod datetime;
 pub mod partial_evaluation;
 
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock};
 
 use crate::ast::{Extension, ExtensionFunction, Name};
 use crate::entities::SchemaType;
@@ -39,7 +39,7 @@ use thiserror::Error;
 use self::extension_function_lookup_errors::FuncDoesNotExistError;
 use self::extension_initialization_errors::FuncMultiplyDefinedError;
 
-static ALL_AVAILABLE_EXTENSION_OBJECTS: LazyLock<Vec<Extension>> = LazyLock::new(|| {
+fn builtin_extensions() -> Vec<Extension> {
     vec![
         #[cfg(feature = "ipaddr")]
         ipaddr::extension(),
@@ -50,7 +50,12 @@ static ALL_AVAILABLE_EXTENSION_OBJECTS: LazyLock<Vec<Extension>> = LazyLock::new
         #[cfg(feature = "partial-eval")]
         partial_evaluation::extension(),
     ]
-});
+}
+
+static ALL_AVAILABLE_EXTENSION_OBJECTS: LazyLock<Mutex<Option<Vec<Extension>>>> =
+    LazyLock::new(|| Mutex::new(Some(builtin_extensions())));
+
+static ALL_AVAILABLE_EXTENSION_SLICE: OnceLock<&'static [Extension]> = OnceLock::new();
 
 static ALL_AVAILABLE_EXTENSIONS: LazyLock<Extensions<'static>> =
     LazyLock::new(Extensions::build_all_available);
@@ -85,7 +90,7 @@ impl Extensions<'static> {
     fn build_all_available() -> Extensions<'static> {
         // PANIC SAFETY: Builtin extensions define functions/constructors only once. Also tested by many different test cases.
         #[allow(clippy::expect_used)]
-        Self::specific_extensions(&ALL_AVAILABLE_EXTENSION_OBJECTS)
+        Self::specific_extensions(all_available_extension_slice())
             .expect("Default extensions should never error on initialization")
     }
 
@@ -184,6 +189,87 @@ impl<'a> Extensions<'a> {
     }
 }
 
+/// Provides access to the collection of default extension objects used to
+/// construct [`Extensions::all_available`].
+fn all_available_extension_slice() -> &'static [Extension] {
+    ALL_AVAILABLE_EXTENSION_SLICE.get_or_init(|| {
+        let mut guard = ALL_AVAILABLE_EXTENSION_OBJECTS
+            .lock()
+            .expect("mutex for default extensions should not be poisoned");
+        let extensions = guard
+            .take()
+            .expect("default extensions have already been initialized");
+        Box::leak(extensions.into_boxed_slice())
+    })
+}
+
+/// Error indicating that the default extension list cannot be mutably
+/// accessed.
+#[derive(Debug, Diagnostic, Error, PartialEq, Eq)]
+pub enum AllAvailableExtensionObjectsMutError {
+    /// Attempted to mutate the default extensions after `Extensions::all_available()`
+    /// was constructed.
+    #[error("cannot mutate default extensions after initialization")]
+    AlreadyInitialized,
+}
+
+/// Guard providing mutable access to the default extension objects prior to
+/// initialization.
+pub struct AllAvailableExtensionObjectsMut<'a> {
+    guard: MutexGuard<'a, Option<Vec<Extension>>>,
+}
+
+impl std::fmt::Debug for AllAvailableExtensionObjectsMut<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AllAvailableExtensionObjectsMut")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> std::ops::Deref for AllAvailableExtensionObjectsMut<'a> {
+    type Target = Vec<Extension>;
+
+    fn deref(&self) -> &Self::Target {
+        self.guard
+            .as_ref()
+            .expect("guard should contain default extensions while borrowed")
+    }
+}
+
+impl<'a> std::ops::DerefMut for AllAvailableExtensionObjectsMut<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard
+            .as_mut()
+            .expect("guard should contain default extensions while borrowed")
+    }
+}
+
+/// Obtain a mutable view of the default extension objects used for
+/// `Extensions::all_available()`.
+///
+/// # Errors
+///
+/// * Returns [`AllAvailableExtensionObjectsMutError`] if
+///   [`Extensions::all_available`] has already been constructed.
+pub fn all_available_extension_objects_mut() -> std::result::Result<
+    AllAvailableExtensionObjectsMut<'static>,
+    AllAvailableExtensionObjectsMutError,
+> {
+    if ALL_AVAILABLE_EXTENSION_SLICE.get().is_some() {
+        return Err(AllAvailableExtensionObjectsMutError::AlreadyInitialized);
+    }
+
+    let guard = ALL_AVAILABLE_EXTENSION_OBJECTS
+        .lock()
+        .expect("mutex for default extensions should not be poisoned");
+
+    if guard.is_none() {
+        return Err(AllAvailableExtensionObjectsMutError::AlreadyInitialized);
+    }
+
+    Ok(AllAvailableExtensionObjectsMut { guard })
+}
+
 /// Errors occurring while initializing extensions. There are internal errors, so
 /// this enum should not become part of the public API unless we publicly expose
 /// user-defined extension function.
@@ -201,6 +287,38 @@ pub enum ExtensionInitializationError {
     MultipleConstructorsSameSignature(
         #[from] extension_initialization_errors::MultipleConstructorsSameSignatureError,
     ),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::{Extension, Name};
+    #[test]
+    fn cannot_mutate_after_initialization() {
+        let _ = Extensions::all_available();
+        let err = all_available_extension_objects_mut();
+        assert!(matches!(
+            err,
+            Err(AllAvailableExtensionObjectsMutError::AlreadyInitialized)
+        ));
+    }
+
+    #[test]
+    fn can_mutate_before_initialization() {
+        // Ensure we can obtain a mutable view and modify the list before
+        // initialization. Restore the original state before dropping the guard.
+        let mut guard = all_available_extension_objects_mut().expect("should provide access");
+        let original_len = guard.len();
+
+        guard.push(Extension::new(
+            Name::parse_unqualified_name("customExtension").expect("valid name"),
+            std::iter::empty(),
+            std::iter::empty(),
+        ));
+        assert_eq!(guard.len(), original_len + 1);
+        guard.pop();
+        assert_eq!(guard.len(), original_len);
+    }
 }
 
 /// Error subtypes for [`ExtensionInitializationError`]
